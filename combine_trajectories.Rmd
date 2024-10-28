@@ -1,0 +1,50 @@
+---
+title: "Combine Trajectories"
+author: Conor McLaughlin
+---
+
+[PRC Data Challenge](https://ansperformance.eu/study/data-challenge/){.uri}
+
+[Data FAQ](https://ansperformance.eu/study/data-challenge/data.html){.uri}
+
+# Data Import
+
+```{r}
+library(tidyverse)
+library(lubridate)
+library(readr)
+```
+
+# Get Trajectories
+
+```{r}
+# Define the path to the directory containing CSV files
+csv_directory <- "processed_trajectories_v5/"
+file_list <- list.files(path = csv_directory, pattern = "*.csv", full.names = TRUE)
+```
+
+```{r}
+# Function to read and clean each file
+read_and_clean_file <- function(file) {
+  data <- read_csv(file, col_types = cols(.default = "c"))  # Read all columns as characters
+  # Perform type conversion for specific columns
+  data <- data %>%
+    mutate(
+      across(everything(), as.numeric),  # Try to convert all columns to numeric
+      .names = "clean_{col}"
+    ) %>%
+    mutate(across(where(is.character), as.character))  # Convert remaining columns back to character if needed
+  return(data)
+}
+```
+
+```{r}
+# Apply the function to each file and combine results
+combined_df <- file_list %>%
+  lapply(read_and_clean_file) %>%
+  bind_rows()  # Combine all data into a single DataFrame
+```
+
+```{r}
+write_csv(combined_df, "combined_trajectories_v5.csv")
+```

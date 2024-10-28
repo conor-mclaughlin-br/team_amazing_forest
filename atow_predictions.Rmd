@@ -1,0 +1,1206 @@
+---
+title: "ATOW Modeling"
+author: Conor McLaughlin
+---
+
+[PRC Data Challenge](https://ansperformance.eu/study/data-challenge/){.uri}
+
+[Data FAQ](https://ansperformance.eu/study/data-challenge/data.html){.uri}
+
+# Data Import
+
+```{r}
+library(tidyverse)
+library(lubridate)
+library(readr)
+library(ranger)
+```
+
+```{r}
+challenge_set <- read_csv("challenge_set.csv")
+```
+
+```{r}
+submission_set <- read_csv("final_submission_set.csv")
+```
+
+```{r}
+challenge_set <- rbind(challenge_set, submission_set)
+```
+
+### Pull in Plane OEW/MTOW
+
+```{r}
+aircraft_oew_mtow <- read_csv("aircraft_oew_mtow.csv")
+```
+
+```{r}
+challenge_set <- merge(x = challenge_set, y = aircraft_oew_mtow, by = "aircraft_type", all.x = TRUE)
+```
+
+### Quick Linear Regression for TOW by Flown Distance and Aircraft Type
+
+```{r}
+# Fit linear regression models by aircraft_type and get predicted values
+challenge_set <- challenge_set %>%
+  group_by(aircraft_type) %>%
+  do({
+    model <- lm(tow ~ flown_distance, data = na.omit(.))
+    data.frame(., lm_predicted_tow = predict(model, newdata = .))
+  }) %>%
+  ungroup()
+
+# Fit linear regression models by aircraft_type and extract R²
+r_squared_values <- challenge_set %>%
+  group_by(aircraft_type) %>%
+  do(model = lm(tow ~ flown_distance, data = na.omit(.))) %>%
+  summarise(aircraft_type,
+            lm_predicted_tow_r_squared = summary(model)$r.squared
+            )
+
+challenge_set <- merge(x = challenge_set, y = r_squared_values, by = "aircraft_type", all.x = TRUE)
+```
+
+### Pull in Trajectories
+
+```{r}
+combined_trajectories <- read_csv("combined_trajectories_v5.csv")
+
+# Drop extraneous columns
+combined_trajectories <- combined_trajectories %>% select(-median_track, -.names, -count_trajectory_observations)
+```
+
+```{r}
+# Clean Inf: impute with median
+combined_trajectories <- combined_trajectories %>%
+  mutate(across(where(is.numeric), ~ ifelse(is.infinite(.), median(., na.rm = TRUE), .)))
+
+# Clean Negatives
+neg_check_columns <- c("median_altitude", "p25_altitude", "p75_altitude", "max_altitude")
+
+# Replace negative values with the column median
+combined_trajectories <- combined_trajectories %>%
+  mutate(across(all_of(neg_check_columns), ~ ifelse(. < 0, median(., na.rm = TRUE), .)))
+```
+
+```{r}
+challenge_set <- merge(x = challenge_set, y = combined_trajectories, by = "flight_id", all.x = TRUE)
+```
+
+## Data Cleansing
+
+### Clean up Null Trajectories
+
+```{r}
+# Impute NA to Zero
+challenge_set$avg_headwind_tailwind <- ifelse(is.na(challenge_set$avg_headwind_tailwind), 0, challenge_set$avg_headwind_tailwind)
+challenge_set$avg_humidity <- ifelse(is.na(challenge_set$avg_humidity), 0, challenge_set$avg_humidity)
+
+# Impute NA to Median
+# Impute NA to Median for all numeric columns except 'TOW'
+challenge_set <- challenge_set %>%
+  mutate(across(
+    where(is.numeric) & !c('tow'),  # Select numeric columns excluding 'TOW'
+    ~ ifelse(is.na(.), median(., na.rm = TRUE), .)
+  ))
+```
+
+### Clean Up great_circle_distance
+
+```{r}
+challenge_set$great_circle_distance <- ifelse(challenge_set$great_circle_distance < 30, challenge_set$flown_distance, challenge_set$great_circle_distance)
+```
+
+# Modeling
+
+## Feature Engineering
+
+### Cluster Plane Models
+
+```{r}
+# aircraft_type_summary <- challenge_set %>%
+#   group_by(aircraft_type) %>%
+#   summarize(
+#     count = n(),
+#     distinct_operators = n_distinct(airline),
+#     median_flown_distance = median(flown_distance),
+#     min_flown_distance = min(flown_distance),
+#     max_flown_distance = max(flown_distance),
+#     median_flown_velocity = median(flight_duration) / median(flown_distance),
+#     max_flown_velocity = max(flight_duration / flown_distance),
+#     median_tow = median(tow, na.rm = TRUE),
+#     p25_tow = quantile(tow, 0.25, na.rm = TRUE)
+#   )
+# 
+# # do kmeans
+# set.seed(123)
+# kmeans_result <- aircraft_type_summary %>%
+#   select(count, distinct_operators, median_flown_distance, median_flown_velocity, median_tow) %>%
+#   scale() %>%
+#   kmeans(centers = 5)
+# 
+# # Add the cluster labels to the summarized data
+# aircraft_type_summary$cluster = kmeans_result$cluster
+# 
+# # Write to file for use later
+# aircraft_type_summary %>%
+#   select("aircraft_type", "cluster", "median_tow", "median_flown_distance", "count") %>%
+#   arrange(cluster) %>%
+#   write_csv("aircraft_type_clusters_kmeans.csv")
+# 
+# # Plot clusters
+# ggplot(aircraft_type_summary, aes(x = median_flown_distance, y = median_tow, size = log(count), color = factor(cluster))) +
+#   geom_point() +
+#   theme_minimal() +
+#   labs(
+#     title = "K-means Clustering of Aircraft Type",
+#     x = "Median Flown Distance",
+#     y = "Median TOW"
+#   )
+```
+
+### Get Aircraft Type Clusters
+
+```{r}
+aircraft_type_clusters_kmeans <- read_csv("aircraft_type_clusters_kmeans.csv") %>%
+  select("aircraft_type", "cluster") %>% 
+  rename("aircraft_type_cluster" = "cluster")
+
+aircraft_type_clusters_kmeans$aircraft_type_cluster = as.factor(aircraft_type_clusters_kmeans$aircraft_type_cluster)
+
+challenge_set <- merge(x = challenge_set, y = aircraft_type_clusters_kmeans, by = "aircraft_type", all.x = TRUE)
+```
+
+### Get Airport-Centric Data
+
+```{r}
+airports <- read_csv("airports.csv")
+
+airports <- airports %>% select("ident", "gps_code", "latitude_deg", "longitude_deg", "elevation_ft")
+```
+
+#### ADEP Airport Info
+
+```{r}
+# First join on "ident"
+challenge_set <- merge(x = challenge_set, y = airports, by.x = "adep", by.y = "ident", all.x = TRUE) %>%
+  rename("latitude_adep" = "latitude_deg", "longitude_adep" = "longitude_deg", "elevation_ft_adep" = "elevation_ft")
+
+# Find rows where the first join did not succeed (NA values) and join on "gps_code"
+challenge_set_join2 <- merge(x = challenge_set, y = airports, by.x = "adep", by.y = "gps_code", all.x = TRUE)
+
+# Only keep rows where the first join resulted in NA values, but the second join worked
+challenge_set <- challenge_set %>%
+  mutate(
+    latitude_adep = coalesce(latitude_adep, challenge_set_join2$latitude_deg),
+    longitude_adep = coalesce(longitude_adep, challenge_set_join2$longitude_deg),
+    elevation_ft_adep = coalesce(elevation_ft_adep, challenge_set_join2$elevation_ft, 0)
+  )
+```
+
+#### ADES Airport Info
+
+```{r}
+# First join on "ident"
+challenge_set <- merge(x = challenge_set, y = airports, by.x = "ades", by.y = "ident", all.x = TRUE) %>%
+  rename("latitude_ades" = "latitude_deg", "longitude_ades" = "longitude_deg", "elevation_ft_ades" = "elevation_ft")
+
+# Find rows where the first join did not succeed (NA values) and join on "gps_code"
+challenge_set_join2 <- merge(x = challenge_set, y = airports, by.x = "ades", by.y = "gps_code", all.x = TRUE)
+
+# Only keep rows where the first join resulted in NA values, but the second join worked
+challenge_set <- challenge_set %>%
+  mutate(
+    latitude_ades = coalesce(latitude_ades, challenge_set_join2$latitude_deg),
+    longitude_ades = coalesce(longitude_ades, challenge_set_join2$longitude_deg),
+    elevation_ft_ades = coalesce(elevation_ft_ades, challenge_set_join2$elevation_ft, 0)
+  )
+```
+
+```{r}
+# Haversine formula function
+haversine_distance <- function(lat1, lon1, lat2, lon2) {
+  # Convert degrees to radians
+  lat1 <- lat1 * pi / 180
+  lon1 <- lon1 * pi / 180
+  lat2 <- lat2 * pi / 180
+  lon2 <- lon2 * pi / 180
+  
+  # Haversine formula
+  dlat <- lat2 - lat1
+  dlon <- lon2 - lon1
+  a <- sin(dlat / 2)^2 + cos(lat1) * cos(lat2) * sin(dlon / 2)^2
+  c <- 2 * atan2(sqrt(a), sqrt(1 - a))
+  r <- 6371  # Radius of Earth in kilometers
+  distance <- r * c
+  
+  return(distance)  # Return distance in KM
+}
+```
+
+```{r}
+challenge_set <- challenge_set %>% 
+  mutate(
+    great_circle_distance_adep_ades = coalesce(haversine_distance(latitude_ades, longitude_ades, latitude_adep, longitude_adep), great_circle_distance) * 0.539957,  # convert KM to NMI
+    adep_ades_elevation_ft_diff = elevation_ft_adep - elevation_ft_ades
+  )
+```
+
+### Collapse Rare Categories
+
+#### Airline
+
+```{r}
+collapse_rare_categories_by_prop <- function(df, column, prop_threshold = 0.01, new_category = "Other") {
+  # Calculate frequency of each category
+  freq_table <- table(df[[column]])
+  
+  # Find categories that are below the proportion threshold
+  rare_categories <- names(freq_table[freq_table / sum(freq_table) <= prop_threshold])
+  
+  # Replace rare categories with new category (e.g., "Other")
+  df[[column]] <- ifelse(df[[column]] %in% rare_categories, new_category, df[[column]])
+  
+  return(df)
+}
+
+collapse_rare_categories_by_count <- function(df, column, min_count = 50, new_category = "Other") {
+  # Calculate frequency of each category
+  freq_table <- table(df[[column]])
+  
+  # Find categories that are below the absolute count threshold
+  rare_categories <- names(freq_table[freq_table <= min_count])
+  
+  # Replace rare categories with new category (e.g., "Other")
+  df[[column]] <- ifelse(df[[column]] %in% rare_categories, new_category, df[[column]])
+  
+  return(df)
+}
+
+# List of columns to collapse rare categories
+columns_to_collapse_prop <- c("airline", "aircraft_type")
+
+# Loop over each column and collapse rare categories
+for (column in columns_to_collapse_prop) {
+  challenge_set <- collapse_rare_categories_by_prop(challenge_set, column, prop_threshold = 0.0025, new_category = "Rare")
+}
+
+columns_to_collapse_abs <- c("adep", "ades", "country_code_ades", "country_code_adep")
+
+# Loop over each column and collapse rare categories
+for (column in columns_to_collapse_abs) {
+  challenge_set <- collapse_rare_categories_by_count(challenge_set, column, min_count = 3, new_category = "Rare")
+}
+
+```
+
+```{r}
+# hist(challenge_set$flown_distance_over_great_circle,      
+#      breaks = 30, 
+#      col = "blue", 
+#      border = "black")
+```
+
+```{r}
+# challenge_set %>% 
+#   arrange(desc(flown_distance_over_great_circle)) %>% 
+#   head(10)
+```
+
+### Transform Features
+
+```{r}
+challenge_set <- challenge_set %>% 
+  mutate(
+    offblock_time_of_day = case_when(
+      hour(actual_offblock_time) %in% c(6,7,8,9,10,11) ~ 'Morning',
+      hour(actual_offblock_time) %in% c(12,13,14,15,16,17) ~ 'Afternoon',
+      hour(actual_offblock_time) %in% c(18,19,20,21,22,23) ~ 'Evening',
+      hour(actual_offblock_time) %in% c(0,1,2,3,4,5) ~ 'Night',
+      .default = 'Unknown'
+    ),
+    offblock_is_peak = case_when(
+      hour(actual_offblock_time) %in% c(7,8,17,18) ~ 'Peak',
+      .default = 'Off Peak'
+    ),
+    arrival_time_of_day = case_when(
+      hour(arrival_time) %in% c(6,7,8,9,10,11) ~ 'Morning',
+      hour(arrival_time) %in% c(12,13,14,15,16,17) ~ 'Afternoon',
+      hour(arrival_time) %in% c(18,19,20,21,22,23) ~ 'Evening',
+      hour(arrival_time) %in% c(0,1,2,3,4,5) ~ 'Night',
+      .default = 'Unknown'
+    ),
+    arrival_is_peak = case_when(
+      hour(arrival_time) %in% c(7,8,17,18) ~ 'Peak',
+      .default = 'Off Peak'
+    ),
+    day_of_week = wday(date, label = TRUE),
+    is_weekend = if_else(wday(date, label = TRUE) %in% c('Sat', 'Sun'), TRUE, FALSE),
+    week_of_year = as.factor(isoweek(date)),
+    month_of_year = month(date, label = TRUE),
+    is_domestic = if_else(country_code_adep == country_code_ades, TRUE, FALSE),
+    flown_velocity = flown_distance / flight_duration,
+    aircraft_family = substr(aircraft_type, 1, 3),
+    distance_category = cut(flown_distance, breaks = c(0, 1000, 2700, Inf), labels = c("short", "medium", "long")),
+    distance_bucket = coalesce(cut(flown_distance, 
+                          breaks = seq(0, quantile(flown_distance, 0.999, na.rm = TRUE) + 500, by = 500), 
+                          right = FALSE, 
+                          include.lowest = TRUE), 'other'),
+    flown_velocity_bucket = cut(flown_distance / flight_duration, breaks = seq(0, max(flown_distance / flight_duration, na.rm = TRUE) + 1, by = 0.5), right = FALSE, include.lowest = TRUE),
+    relative_distance_adep_ades = cut(flown_distance / ave(flown_distance, adep, ades, FUN = mean), breaks = 10),
+    relative_distance_aircraft_type = flown_distance / ave(flown_distance, aircraft_type, FUN = mean),
+    relative_flown_velocity_aircraft_type = (flown_distance / flight_duration) / ave((flown_distance / flight_duration), aircraft_type, FUN = mean),
+    relative_distance_adep_ades_aircraft_type = cut(flown_distance / ave(flown_distance, adep, ades, aircraft_type, FUN = mean), breaks = 10),
+    relative_distance_airline = flown_distance / ave(flown_distance, airline, FUN = mean),
+    relative_distance_aircraft_type_airline = flown_distance / ave(flown_distance, aircraft_type, airline, FUN = mean),
+    cruise_duration = pmax(flight_duration - 30, 0),
+    flight_minus_taxiout_duration_bucket = coalesce(cut(pmax(flight_duration - taxiout_time, 0), 
+                                               breaks = seq(0, quantile(pmax(flight_duration - taxiout_time, 0), 0.999, na.rm = TRUE) + 30, by = 30),  # Adjust flight_minus_taxiout_duration_bucket based on 99.9th percentile
+                                               right = FALSE, 
+                                               include.lowest = TRUE), 'other'),
+    departure_traffic = ave(flight_id, adep, date, FUN = length),
+    arrival_traffic = ave(flight_id, ades, date, FUN = length),
+    departure_traffic_squared = departure_traffic ^ 2,
+    arrival_traffic_squared = arrival_traffic ^ 2,
+    departure_traffic_bucket = cut(departure_traffic, breaks = 10),
+    arrival_traffic_bucket = cut(arrival_traffic, breaks = 10),
+    product_departure_traffic_arrival_traffic = departure_traffic * arrival_traffic,
+    log_flight_duration = log1p(flight_duration),
+    log_flown_distance = log1p(flown_distance),
+    log_flown_distance_bucket = cut(log1p(flown_distance), breaks = 10),
+    log_flown_velocity = log1p(flown_distance / flight_duration),
+    flown_distance_squared = flown_distance ^ 2,
+    flown_distance_sqrt = sqrt(flown_distance),
+    flown_velocity_squared = (flown_distance / flight_duration) ^ 2,
+    flown_velocity_sqrt = sqrt(flown_distance / flight_duration),
+    taxiout_time_bucket = cut(taxiout_time, breaks = 10),
+    taxiout_time_squared = taxiout_time ^ 2,
+    taxiout_to_flight_duration_ratio = taxiout_time / flight_duration,
+    taxiout_to_flight_duration_sqrt = sqrt(taxiout_time / flight_duration),
+    log_great_circle_distance_adep_ades = log1p(great_circle_distance_adep_ades),
+    great_circle_distance_squared = great_circle_distance_adep_ades ^ 2,
+    great_circle_distance_sqrt = sqrt(great_circle_distance_adep_ades),
+    log_median_altitude = log1p(median_altitude),
+    median_altitude_squared = median_altitude ^ 2,
+    log_median_groundspeed = log1p(median_groundspeed),
+    altitude_range = p75_altitude - p25_altitude,
+    groundspeed_range = p75_groundspeed - p25_groundspeed,
+    altitude_range_bucket = cut(altitude_range, breaks = 10),
+    groundspeed_range_bucket = cut(groundspeed_range, breaks = 10),
+    flown_distance_over_great_circle = flown_distance / great_circle_distance_adep_ades,
+    great_circle_distance_bucket = coalesce(cut(great_circle_distance_adep_ades, 
+                                       breaks = seq(0, quantile(great_circle_distance_adep_ades, 0.999, na.rm = TRUE) + 500, by = 500),  # Adjust great_circle_distance_bucket based on 99.9th percentile
+                                       right = FALSE, 
+                                       include.lowest = TRUE), 'other'), 
+    total_time_ascent_squared = total_time_ascent ^ 2,
+    total_time_ascent_bucket = cut(total_time_ascent, breaks = 10),
+    total_time_descent_squared = total_time_descent ^ 2,
+    total_time_descent_bucket = cut(total_time_descent, breaks = 10),
+    pct_total_time_ascent = total_time_ascent / flight_duration,
+    pct_total_time_descent = total_time_descent / flight_duration,
+    mtow_oew_diff = mtow - oew,
+    pct_max_flown_distance_by_aircraft_type = cut((flown_distance / ave(flown_distance, aircraft_type, FUN = max)), breaks = 10),
+    headwind_tailwind_bucket = cut(avg_headwind_tailwind, breaks = 10),
+    avg_humidity_sqrt = sqrt(avg_humidity),
+    avg_humidity_bucket = cut(avg_humidity_sqrt, breaks = 10),
+    flown_distance_pct_range = flown_distance / range,
+    predicted_tow_category = cut(lm_predicted_tow, breaks = quantile(lm_predicted_tow, probs = seq(0, 1, 0.1)), include.lowest = TRUE),
+    lm_predicted_tow_squared = lm_predicted_tow^2,
+    lm_predicted_tow_cubed = lm_predicted_tow^3,
+    log_lm_predicted_tow = log(lm_predicted_tow + 1),
+    r_squared_category = cut(lm_predicted_tow_r_squared,
+                                         breaks = c(-Inf, 0, 0.5, 0.7, 0.9, 1),
+                                         labels = c("Very Poor", "Poor", "Average", "Good", "Excellent"),
+                                         include.lowest = TRUE)
+
+  )
+```
+
+### Make Interaction Variables
+
+```{r}
+# aircraft type cluster
+challenge_set$interaction_aircraft_type_cluster_log_great_circle_distance_adep_ades <- interaction(challenge_set$aircraft_type_cluster, challenge_set$log_great_circle_distance_adep_ades)
+challenge_set$interaction_aircraft_type_cluster_log_flown_distance <- interaction(challenge_set$aircraft_type_cluster, challenge_set$log_flown_distance)
+challenge_set$interaction_aircraft_type_cluster_log_flight_duration <- interaction(challenge_set$aircraft_type_cluster, challenge_set$log_flight_duration)
+challenge_set$interaction_aircraft_type_cluster_flown_distance_squared <- interaction(challenge_set$aircraft_type_cluster, challenge_set$flown_distance_squared)
+challenge_set$interaction_aircraft_type_cluster_cruise_duration <- interaction(challenge_set$aircraft_type_cluster, challenge_set$cruise_duration)
+challenge_set$interaction_aircraft_type_cluster_total_time_ascent <- interaction(challenge_set$aircraft_type_cluster, challenge_set$total_time_ascent)
+challenge_set$interaction_aircraft_type_cluster_airline <- interaction(challenge_set$airline, challenge_set$aircraft_type_cluster)
+challenge_set$interaction_aircraft_type_cluster_adep <- interaction(challenge_set$adep, challenge_set$aircraft_type_cluster)
+challenge_set$interaction_aircraft_type_cluster_ades <- interaction(challenge_set$ades, challenge_set$aircraft_type_cluster)
+challenge_set$interaction_aircraft_type_cluster_distance_bucket <- interaction(challenge_set$distance_bucket, challenge_set$aircraft_type_cluster)
+challenge_set$interaction_aircraft_type_cluster_flown_velocity_bucket <- interaction(challenge_set$aircraft_type_cluster, challenge_set$flown_velocity_bucket)
+challenge_set$interaction_aircraft_type_cluster_median_altitude <- interaction(challenge_set$aircraft_type_cluster, challenge_set$median_altitude)
+challenge_set$interaction_aircraft_type_cluster_log_median_altitude <- interaction(challenge_set$aircraft_type_cluster, challenge_set$log_median_altitude)
+challenge_set$interaction_aircraft_type_cluster_p25_altitude <- interaction(challenge_set$aircraft_type_cluster, challenge_set$p25_altitude)
+challenge_set$interaction_aircraft_type_cluster_max_altitude <- interaction(challenge_set$aircraft_type_cluster, challenge_set$max_altitude)
+challenge_set$interaction_aircraft_type_cluster_total_time_ascent <- interaction(challenge_set$total_time_ascent, challenge_set$aircraft_type_cluster)
+challenge_set$interaction_aircraft_type_cluster_total_time_descent <- interaction(challenge_set$total_time_descent, challenge_set$aircraft_type_cluster)
+challenge_set$interaction_aircraft_type_cluster_total_time_climb_4 <- interaction(challenge_set$total_time_climb_4, challenge_set$aircraft_type_cluster)
+challenge_set$interaction_aircraft_type_cluster_percentage_time_climb_4 <- interaction(challenge_set$percentage_time_climb_4, challenge_set$aircraft_type_cluster)
+challenge_set$interaction_aircraft_type_cluster_month_of_year <- interaction(challenge_set$aircraft_type_cluster, challenge_set$month_of_year)
+challenge_set$interaction_aircraft_type_cluster_country_code_ades <- interaction(challenge_set$aircraft_type_cluster, challenge_set$country_code_ades)
+challenge_set$interaction_aircraft_type_cluster_log_flown_velocity <- interaction(challenge_set$aircraft_type_cluster, challenge_set$log_flown_velocity)
+challenge_set$interaction_aircraft_family_distance_category <- interaction(challenge_set$aircraft_family, challenge_set$distance_category)
+challenge_set$interaction_aircraft_type_cluster_product_departure_traffic_arrival_traffic <- interaction(challenge_set$aircraft_type_cluster, challenge_set$product_departure_traffic_arrival_traffic)
+challenge_set$interaction_aircraft_type_distance_bucket_airline <- interaction(challenge_set$distance_bucket, challenge_set$aircraft_type, challenge_set$aircraft_type)
+
+# aircraft type
+challenge_set$interaction_aircraft_type_distance_bucket <- interaction(challenge_set$distance_bucket, challenge_set$aircraft_type)
+challenge_set$interaction_aircraft_type_flight_minus_taxiout_duration_bucket <- interaction(challenge_set$flight_minus_taxiout_duration_bucket, challenge_set$aircraft_type)
+challenge_set$interaction_aircraft_type_flown_velocity_bucket <- interaction(challenge_set$aircraft_type, challenge_set$flown_velocity_bucket)
+challenge_set$interaction_aircraft_type_median_altitude <- interaction(challenge_set$aircraft_type, challenge_set$median_altitude)
+challenge_set$interaction_aircraft_type_offblock_time_of_day <- interaction(challenge_set$offblock_time_of_day, challenge_set$aircraft_type)
+challenge_set$interaction_aircraft_type_month_of_year <- interaction(challenge_set$aircraft_type, challenge_set$month_of_year)
+challenge_set$interaction_aircraft_type_offblock_is_peak <- interaction(challenge_set$aircraft_type, challenge_set$offblock_is_peak)
+challenge_set$interaction_aircraft_type_pct_max_distance_flown_by_aircraft_type <- interaction(challenge_set$aircraft_type, challenge_set$pct_max_flown_distance_by_aircraft_type)
+challenge_set$interaction_aircraft_type_altitude_range_bucket <- interaction(challenge_set$aircraft_type, challenge_set$altitude_range_bucket)
+challenge_set$interaction_aircraft_type_groundspeed_range_bucket <- interaction(challenge_set$aircraft_type, challenge_set$groundspeed_range_bucket)
+challenge_set$interaction_aircraft_type_elevation_ft_adep <- interaction(challenge_set$aircraft_type, challenge_set$elevation_ft_adep)
+challenge_set$interaction_aircraft_type_country_code_adep <- interaction(challenge_set$aircraft_type, challenge_set$country_code_adep)
+challenge_set$interaction_aircraft_type_country_code_ades <- interaction(challenge_set$aircraft_type, challenge_set$country_code_ades)
+challenge_set$interaction_aircraft_type_airline <- interaction(challenge_set$aircraft_type, challenge_set$airline)
+challenge_set$interaction_aircraft_type_adep <- interaction(challenge_set$aircraft_type, challenge_set$adep)
+challenge_set$interaction_aircraft_type_ades <- interaction(challenge_set$aircraft_type, challenge_set$ades)
+challenge_set$interaction_aircraft_type_aircraft_family <- interaction(challenge_set$aircraft_type, challenge_set$aircraft_family)
+challenge_set$interaction_aircraft_type_taxiout_time_bucket <- interaction(challenge_set$aircraft_type, challenge_set$taxiout_time_bucket)
+challenge_set$interaction_aircraft_type_month_of_year <- interaction(challenge_set$aircraft_type, challenge_set$month_of_year)
+challenge_set$interaction_aircraft_type_offblock_time_of_day <- interaction(challenge_set$aircraft_type, challenge_set$offblock_time_of_day)
+challenge_set$interaction_aircraft_type_offblock_is_peak <- interaction(challenge_set$aircraft_type, challenge_set$offblock_is_peak)
+challenge_set$interaction_aircraft_type_total_time_ascent_bucket <- interaction(challenge_set$aircraft_type, challenge_set$total_time_ascent_bucket)
+challenge_set$interaction_aircraft_type_total_time_descent_bucket <- interaction(challenge_set$aircraft_type, challenge_set$total_time_descent_bucket)
+challenge_set$interaction_aircraft_type_departure_traffic_bucket <- interaction(challenge_set$aircraft_type, challenge_set$departure_traffic_bucket)
+challenge_set$interaction_aircraft_type_distance_category <- interaction(challenge_set$aircraft_type, challenge_set$distance_category)
+challenge_set$interaction_aircraft_type_product_departure_traffic_arrival_traffic <- interaction(challenge_set$aircraft_type, challenge_set$product_departure_traffic_arrival_traffic)
+challenge_set$interaction_aircraft_type_predicted_tow <- interaction(challenge_set$aircraft_type, challenge_set$lm_predicted_tow)
+
+
+# airline
+interaction_airline_flight_duration <- interaction(challenge_set$airline, challenge_set$flight_duration)
+interaction_airline_great_circle_distance <- interaction(challenge_set$airline, challenge_set$great_circle_distance_adep_ades)
+interaction_airline_flown_distance <- interaction(challenge_set$airline, challenge_set$flown_distance)
+challenge_set$interaction_airline_aircraft_type <- interaction(challenge_set$airline, challenge_set$aircraft_type)
+challenge_set$interaction_airline_distance_bucket <- interaction(challenge_set$distance_bucket, challenge_set$airline)
+challenge_set$interaction_airline_distance_category <- interaction(challenge_set$distance_category, challenge_set$airline)
+challenge_set$interaction_airline_flight_minus_taxiout_duration_bucket <- interaction(challenge_set$flight_minus_taxiout_duration_bucket, challenge_set$airline)
+challenge_set$interaction_airline_offblock_time_of_day <- interaction(challenge_set$distance_bucket, challenge_set$offblock_time_of_day)
+challenge_set$interaction_airline_product_departure_traffic_arrival_traffic <- interaction(challenge_set$airline, challenge_set$product_departure_traffic_arrival_traffic)
+interaction_airline_offblock_is_peak <- interaction(challenge_set$airline, challenge_set$offblock_is_peak)
+interaction_airline_month_of_year <- interaction(challenge_set$airline, challenge_set$month_of_year)
+interaction_airline_day_of_week <- interaction(challenge_set$airline, challenge_set$day_of_week)
+interaction_airline_distance_category <- interaction(challenge_set$airline, challenge_set$distance_category)
+interaction_airline_country_code_adep <- interaction(challenge_set$airline, challenge_set$country_code_adep)
+interaction_airline_country_code_ades <- interaction(challenge_set$airline, challenge_set$country_code_ades)
+interaction_airline_departure_traffic <- interaction(challenge_set$airline, challenge_set$departure_traffic)
+interaction_airline_taxiout_time <- interaction(challenge_set$airline, challenge_set$taxiout_time)
+interaction_airline_total_time_ascent <- interaction(challenge_set$airline, challenge_set$total_time_ascent)
+interaction_airline_flight_minus_taxiout_duration_bucket <- interaction(challenge_set$airline, challenge_set$flight_minus_taxiout_duration_bucket)
+interaction_airline_flown_velocity_bucket <- interaction(challenge_set$airline, challenge_set$flown_velocity_bucket)
+interaction_airline_altitude_range_bucket <- interaction(challenge_set$airline, challenge_set$altitude_range_bucket)
+interaction_airline_avg_humidity_bucket <- interaction(challenge_set$airline, challenge_set$avg_humidity_bucket)
+interaction_airline_distance_bucket <- interaction(challenge_set$airline, challenge_set$distance_bucket)
+interaction_airline_headwind_tailwind_bucket <- interaction(challenge_set$airline, challenge_set$headwind_tailwind_bucket)
+
+
+# adep 
+challenge_set$interaction_adep_airline <- interaction(challenge_set$adep, challenge_set$airline)
+challenge_set$interaction_adep_aircraft_type <- interaction(challenge_set$adep, challenge_set$aircraft_type)
+challenge_set$interaction_adep_month_of_year <- interaction(challenge_set$adep, challenge_set$month_of_year)
+challenge_set$interaction_adep_ades <- interaction(challenge_set$adep, challenge_set$ades)
+challenge_set$interaction_adep_ades_airline <- interaction(challenge_set$interaction_adep_ades, challenge_set$airline)
+challenge_set$interaction_adep_distance_bucket <- interaction(challenge_set$adep, challenge_set$distance_bucket)
+challenge_set$interaction_adep_flown_distance_squared <- interaction(challenge_set$adep, challenge_set$flown_distance_squared)
+
+# ades
+challenge_set$interaction_ades_airline <- interaction(challenge_set$ades, challenge_set$airline)
+challenge_set$interaction_ades_aircraft_type <- interaction(challenge_set$ades, challenge_set$aircraft_type)
+challenge_set$interaction_ades_month_of_year <- interaction(challenge_set$ades, challenge_set$month_of_year)
+challenge_set$interaction_country_code_ades_country_code_adep <- interaction(challenge_set$country_code_ades, challenge_set$country_code_adep)
+challenge_set$interaction_country_code_ades_flown_distance_bucket <- interaction(challenge_set$country_code_ades, challenge_set$distance_bucket)
+challenge_set$interaction_country_code_ades_flown_distance_squared <- interaction(challenge_set$country_code_ades, challenge_set$flown_distance_squared)
+
+# time
+challenge_set$interaction_day_of_week_departure_traffic <- interaction(challenge_set$day_of_week, challenge_set$departure_traffic)
+challenge_set$interaction_month_of_year_aircraft_type_cluster_flown_distance_bucket <- interaction(challenge_set$month_of_year, challenge_set$aircraft_type_cluster, challenge_set$distance_bucket)
+challenge_set$interaction_distance_bucket_offblock_time_of_day <- interaction(challenge_set$distance_bucket, challenge_set$offblock_time_of_day)
+
+# great_circle_distance_bucket
+challenge_set$interaction_great_circle_distance_bucket_aircraft_type_cluster <- interaction(challenge_set$great_circle_distance_bucket, challenge_set$aircraft_type_cluster)
+challenge_set$interaction_great_circle_distance_bucket_aircraft_type <- interaction(challenge_set$great_circle_distance_bucket, challenge_set$aircraft_type)
+challenge_set$interaction_great_circle_distance_bucket_flown_velocity_bucket <- interaction(challenge_set$great_circle_distance_bucket, challenge_set$flown_velocity_bucket)
+challenge_set$interaction_great_circle_distance_bucket_country_code_ades <- interaction(challenge_set$great_circle_distance_bucket, challenge_set$country_code_ades)
+challenge_set$interaction_great_circle_distance_bucket_median_altitude <- interaction(challenge_set$great_circle_distance_bucket, challenge_set$median_altitude)
+
+# continuous variable interactions
+challenge_set$interaction_log_great_circle_distance_adep_ades_log_median_altitude <- interaction(challenge_set$log_great_circle_distance_adep_ades, challenge_set$log_median_altitude)
+challenge_set$interaction_distance_category_median_groundspeed <- interaction(challenge_set$distance_category, challenge_set$median_groundspeed)
+challenge_set$interaction_total_time_ascent_aircraft_type <- interaction(challenge_set$total_time_ascent, challenge_set$aircraft_type)
+challenge_set$interaction_total_time_descent_aircraft_type <- interaction(challenge_set$total_time_descent, challenge_set$aircraft_type)
+challenge_set$interaction_altitude_range_bucket_distance_bucket <- interaction(challenge_set$altitude_range_bucket, challenge_set$distance_bucket)
+challenge_set$interaction_groundspeed_range_distance_bucket <- interaction(challenge_set$groundspeed_range_bucket, challenge_set$distance_bucket)
+
+# Catchall
+challenge_set$interaction_taxiout_time_flown_distance <- interaction(challenge_set$taxiout_time, challenge_set$flown_distance)
+challenge_set$interaction_taxiout_time_great_circle_distance_adep_ades <- interaction(challenge_set$taxiout_time, challenge_set$great_circle_distance_adep_ades)
+challenge_set$interaction_log_flown_distance_offblock_time_of_day <- interaction(challenge_set$log_flown_distance, challenge_set$offblock_time_of_day)
+challenge_set$interaction_total_time_ascent_offblock_is_peak <- interaction(challenge_set$total_time_ascent, challenge_set$offblock_is_peak)
+challenge_set$interaction_month_of_year_log_flown_distance <- interaction(challenge_set$month_of_year, challenge_set$log_flown_distance)
+challenge_set$interaction_headwind_tailwind_bucket_altitude_range_bucket <- interaction(challenge_set$headwind_tailwind_bucket, challenge_set$altitude_range_bucket)
+challenge_set$interaction_avg_humidity_bucket_total_time_ascent_bucket <- interaction(challenge_set$avg_humidity_bucket, challenge_set$total_time_ascent_bucket)
+challenge_set$interaction_oew_flown_distance <- interaction(challenge_set$oew, challenge_set$flown_distance)
+challenge_set$interaction_mtw_oew_diff_distance_bucket <- interaction(challenge_set$mtow_oew_diff, challenge_set$distance_bucket)
+challenge_set$interaction_country_code_adep_elevation_ft_adep <- interaction(challenge_set$country_code_adep, challenge_set$elevation_ft_adep)
+challenge_set$interaction_country_code_ades_elevation_ft_ades <- interaction(challenge_set$country_code_ades, challenge_set$elevation_ft_ades)
+challenge_set$interaction_departure_traffic_distance_category <- interaction(challenge_set$departure_traffic, challenge_set$distance_category)
+challenge_set$interaction_log_flown_distance_bucket_altitude_range_bucket <- interaction(challenge_set$log_flown_distance_bucket, challenge_set$altitude_range_bucket)
+challenge_set$interaction_offblock_time_of_day_log_flown_distance_bucket <- interaction(challenge_set$offblock_time_of_day, challenge_set$log_flown_distance_bucket)
+challenge_set$interaction_flight_duration_day_of_week <- interaction(challenge_set$flight_duration, challenge_set$day_of_week)
+challenge_set$interaction_flight_duration_is_weekend <- interaction(challenge_set$flight_duration, challenge_set$is_weekend)
+challenge_set$interaction_offblock_is_peak_month_of_year <- interaction(challenge_set$offblock_is_peak, challenge_set$month_of_year)
+challenge_set$interaction_day_of_week_arrival_time_of_day <- interaction(challenge_set$day_of_week, challenge_set$arrival_time_of_day)
+challenge_set$interaction_week_of_year_offblock_time_of_day <- interaction(challenge_set$week_of_year, challenge_set$offblock_time_of_day)
+challenge_set$interaction_total_time_ascent_is_weekend <- interaction(challenge_set$total_time_ascent, challenge_set$is_weekend)
+challenge_set$interaction_month_of_year_percentage_time_climb_4 <- interaction(challenge_set$month_of_year, challenge_set$percentage_time_climb_4)
+challenge_set$interaction_avg_humidity_bucket_flight_duration <- interaction(challenge_set$avg_humidity_bucket, challenge_set$flight_duration)
+challenge_set$interaction_departure_traffic_bucket_arrival_traffic_bucket <- interaction(challenge_set$departure_traffic_bucket, challenge_set$arrival_traffic_bucket)
+challenge_set$interaction_flight_duration_predicted_tow <- challenge_set$flight_duration * challenge_set$lm_predicted_tow
+challenge_set$interaction_flown_distance_predicted_tow <- challenge_set$flown_distance * challenge_set$lm_predicted_tow
+challenge_set$interaction_flown_distance_r_squared <- challenge_set$flown_distance * challenge_set$lm_predicted_tow_r_squared
+challenge_set$interaction_taxiout_time_r_squared <- challenge_set$taxiout_time * challenge_set$lm_predicted_tow_r_squared
+challenge_set$interaction_aircraft_type_r_squared <- interaction(challenge_set$aircraft_type, challenge_set$lm_predicted_tow_r_squared)
+challenge_set$interaction_r_squared_category_predicted_tow_category <- interaction(challenge_set$r_squared_category, challenge_set$predicted_tow_category)
+```
+
+## Designate Features
+
+```{r}
+# Define the list of columns to exclude
+exclude_columns <- c("date", "callsign", "name_adep", "name_ades", "actual_offblock_time", "arrival_time", "tow", "flight_id", ".names", "median_track", "iqr_groundspeed", "median_u_component", "median_v_component", "median_wind_direction", "diff_track_vs_wind_direction", "wtc", "gps_code.x", "gps_code.y", "longitude_adep", "longitude_ades", "latitude_adep", "latitude_ades", "out_and_back_trip", "great_circle_distance")
+
+# Get the names of all columns in the dataframe
+all_columns <- names(challenge_set)
+
+# Get the names of columns excluding the specified ones
+features <- setdiff(all_columns, exclude_columns)
+
+# View the selected features
+print(features)
+```
+
+## Visualize Feature Distributions
+
+```{r, fig.width=8, fig.height=25, out.width='100%'}
+# # Load necessary libraries
+# library(tidyr)  # For pivoting data
+# 
+# # Select numeric columns
+# challenge_set %>% 
+#   select(all_of(features)) %>%
+#   select_if(is.numeric) %>%
+# # Pivot longer to prepare for plotting
+#   pivot_longer(everything(), names_to = "feature", values_to = "value") %>%
+#   # Plot histograms for each numeric feature
+#   ggplot(aes(x = value)) +
+#     geom_histogram(bins = 30, fill = 'blue', color = 'white', alpha = 0.7) +
+#     facet_wrap(~ feature, scales = "free", ncol = 3) +  # Creates one histogram per feature
+#     theme_minimal() +
+#     labs(title = "Histograms of Numeric Features", x = "Value", y = "Frequency")
+```
+
+```{r}
+# Generate formula from vector
+formula <- as.formula(paste("tow ~", paste(features, collapse = " + ")))
+```
+
+## Divide up Dataframe
+
+```{r}
+set.seed(23)
+
+# Remove submission set rows from challenge_set
+challenge_set <- challenge_set %>% filter(!is.na(tow))
+
+# Test and Train split
+sample_index <- sample(1:nrow(challenge_set), 0.8 * nrow(challenge_set))
+train_data <- challenge_set[sample_index, ]
+test_data <- challenge_set[-sample_index, ]
+```
+
+# Train Model
+
+```{r}
+# Train random forest regression model
+rf_model <- ranger(
+  formula, 
+  data = train_data, 
+  importance = 'impurity', 
+  num.trees = 500, 
+  min.node.size = 5,
+  save.memory = TRUE,
+  replace = TRUE,
+  sample.fraction = 0.7
+)
+
+# View the model summary
+print(rf_model)
+```
+
+## Save Model
+
+```{r}
+saveRDS(rf_model, file = "saved_models/random_forest_model_v18.rds")
+```
+
+## Measure Performance
+
+```{r}
+# Make predictions on the test set
+predictions <- predict(rf_model, data = test_data)$predictions
+
+# Calculate MAPE
+mape <- mean(abs((test_data$tow - predictions) / test_data$tow)) * 100
+print(paste("MAPE: ", mape))
+
+# Calculate MAE
+mae <- mean(predictions - test_data$tow)
+print(paste("Mean Absolute Error: ", mae))
+
+# Calculate MSE
+mse <- mean((predictions - test_data$tow)^2)
+print(paste("Mean Squared Error: ", mse))
+
+# Calculate RMSE
+rmse <- sqrt(mse)
+print(paste("Root Mean Squared Error: ", rmse))
+
+# Calculate R2
+r_squared <- 1 - (sum((predictions - test_data$tow)^2) / sum((mean(train_data$tow) - test_data$tow)^2))
+print(paste("R-squared: ", r_squared))
+```
+
+
+```{r}
+# Assuming rf_model is your ranger model
+importance_data <- as.data.frame(rf_model$variable.importance)
+
+# Convert the row names (variable names) into a column
+importance_data$Variable <- rownames(importance_data)
+
+# Rename the column for clarity
+colnames(importance_data) <- c("Importance", "Variable")
+
+# Sort the data by importance for better visualization
+importance_data <- importance_data[order(importance_data$Importance, decreasing = TRUE),]
+
+# Load ggplot2
+library(ggplot2)
+
+# Create the plot
+ggplot(importance_data, aes(x = reorder(Variable, Importance), y = Importance)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  xlab("Variables") +
+  ylab("Importance") +
+  ggtitle("Feature Importance from Random Forest Model") +
+  labs(subtitle = paste("Root Mean Squared Error: ", rmse)) +
+  theme_minimal()
+
+```
+
+```{r}
+ggsave(paste("training_results_", Sys.time(), ".png", sep = ""), path = "importances", height = 25, width = 8, units = "in", dpi = 300, bg = "white")
+```
+
+## Where are we Missing?
+
+```{r}
+# Calculate residuals
+residuals <- test_data$tow - predictions
+```
+
+```{r}
+# Histogram of residuals
+hist(residuals, main = "Histogram of Residuals", xlab = "Residuals", breaks = 50)
+```
+
+```{r}
+plot(predictions, residuals,
+     main = "Residuals vs Fitted",
+     xlab = "Predictions",
+     ylab = "Residuals")
+abline(h = 0, col = "red")
+```
+
+```{r}
+# MAE and % Miss vs Actuals
+test_data %>% 
+  mutate(
+    residual = tow - predictions,
+    prediction = predictions
+  ) %>% 
+  group_by(aircraft_type) %>% 
+  summarize(
+    count = n(),
+    pct_of_total = (n() / nrow(test_data)) * 100,
+    mae = mean(abs(residual)),
+    avg_tow = mean(tow),
+    max_pct_tow = mean(abs(residual)) / mean(tow),
+    mape = mean(abs(residual / tow)) * 100,
+    rmse = mean(sqrt((residual)^2)),
+    avg_dist = mean(flown_distance),
+    min_prediction = min(prediction),
+    min_tow = min(tow),
+    max_prediction = max(prediction),
+    max_tow = max(tow)
+  ) %>%
+  arrange(desc(count)) %>%
+  print()
+```
+
+
+```{r}
+test_data %>% 
+  mutate(
+    residual = tow - predictions,
+    prediction = predictions
+  ) %>%
+  group_by(interaction_aircraft_type_cluster_airline) %>% 
+  summarize(
+    count = n(),
+    pct_of_total = (n() / nrow(test_data)) * 100,
+    mae = mean(abs(residual)),
+    avg_tow = mean(tow),
+    max_pct_tow = mean(abs(residual)) / mean(tow),
+    mape = mean(abs(residual / tow)) * 100,,
+    rmse = mean(sqrt((residual)^2)),
+    avg_dist = mean(flown_distance),
+    min_prediction = min(prediction),
+    min_tow = min(tow),
+    max_prediction = max(prediction),
+    max_tow = max(tow)
+  ) %>%
+  arrange(desc(count)) %>%
+  print()
+```
+
+```{r}
+test_data %>% 
+  mutate(
+    residual = tow - predictions,
+    prediction = predictions,
+    actual_tow = tow
+  ) %>% 
+  filter(aircraft_type == "A333") %>%
+  arrange(residual) %>%
+  head(10)
+```
+
+```{r}
+test_data %>% 
+  mutate(
+    residual = tow - predictions,
+    prediction = predictions,
+    actual_tow = tow
+  ) %>% 
+  filter(aircraft_type == "A333") %>%
+  arrange(desc(residual)) %>%
+  head(10)
+```
+
+```{r}
+# MAE and % Miss vs Actuals
+test_data %>% 
+  mutate(
+    residual = tow - predictions,
+    prediction = predictions
+  ) %>%
+  group_by(aircraft_type_cluster) %>% 
+  summarize(
+    count = n(),
+    pct_of_total = (n() / nrow(test_data)) * 100,
+    mae = mean(abs(residual)),
+    avg_tow = mean(tow),
+    max_pct_tow = mean(abs(residual)) / mean(tow),
+    mape = mean(abs(residual / tow)) * 100,,
+    rmse = mean(sqrt((residual)^2)),
+    avg_dist = mean(flown_distance),
+    min_prediction = min(prediction),
+    min_tow = min(tow),
+    max_prediction = max(prediction),
+    max_tow = max(tow)
+  ) %>%
+  arrange(desc(count)) %>%
+  print()
+```
+
+```{r}
+# MAE and % Miss vs Actuals
+test_data %>% 
+  mutate(
+    residual = tow - predictions,
+    prediction = predictions
+  ) %>%
+  group_by(distance_category) %>% 
+  summarize(
+    count = n(),
+    pct_of_total = (n() / nrow(test_data)) * 100,
+    mae = mean(abs(residual)),
+    avg_tow = mean(tow),
+    max_pct_tow = mean(abs(residual)) / mean(tow),
+    mape = mean(abs(residual / tow)) * 100,
+    rmse = mean(sqrt((residual)^2)),
+    avg_dist = mean(flown_distance),
+    min_prediction = min(prediction),
+    min_tow = min(tow),
+    max_prediction = max(prediction),
+    max_tow = max(tow)
+  ) %>%
+  arrange(desc(count)) %>%
+  print()
+```
+
+```{r}
+# MAE and % Miss vs Actuals
+test_data %>% 
+  mutate(
+    residual = tow - predictions,
+    prediction = predictions
+  ) %>%
+  group_by(distance_bucket) %>% 
+  summarize(
+    count = n(),
+    pct_of_total = (n() / nrow(test_data)) * 100,
+    mae = mean(abs(residual)),
+    avg_tow = mean(tow),
+    max_pct_tow = mean(abs(residual)) / mean(tow),
+    mape = mean(abs(residual / tow)) * 100,
+    rmse = mean(sqrt((residual)^2)),
+    avg_dist = mean(flown_distance),
+    min_prediction = min(prediction),
+    min_tow = min(tow),
+    max_prediction = max(prediction),
+    max_tow = max(tow)
+  ) %>%
+  arrange(distance_bucket) %>%
+  print()
+```
+
+```{r}
+# MAE and % Miss vs Actuals
+test_data %>% 
+  mutate(
+    residual = tow - predictions,
+    prediction = predictions
+  ) %>%
+  group_by(airline) %>% 
+  summarize(
+    count = n(),
+    pct_of_total = (n() / nrow(test_data)) * 100,
+    mae = mean(abs(residual)),
+    avg_tow = mean(tow),
+    max_pct_tow = mean(abs(residual)) / mean(tow),
+    mape = mean(abs(residual / tow)) * 100,
+    rmse = mean(sqrt((residual)^2)),
+    avg_dist = mean(flown_distance),
+    min_prediction = min(prediction),
+    min_tow = min(tow),
+    max_prediction = max(prediction),
+    max_tow = max(tow)
+  ) %>%
+  arrange(desc(count)) %>%
+  print()
+```
+
+
+```{r}
+# MAE and % Miss vs Actuals
+test_data %>% 
+  mutate(
+    residual = tow - predictions,
+    prediction = predictions
+  ) %>%
+  group_by(country_code_adep) %>% 
+  summarize(
+    count = n(),
+    pct_of_total = (n() / nrow(test_data)) * 100,
+    mae = mean(abs(residual)),
+    avg_tow = mean(tow),
+    max_pct_tow = mean(abs(residual)) / mean(tow),
+    mape = mean(abs(residual / tow)) * 100,
+    rmse = mean(sqrt((residual)^2)),
+    avg_dist = mean(flown_distance),
+    min_prediction = min(prediction),
+    min_tow = min(tow),
+    max_prediction = max(prediction),
+    max_tow = max(tow)
+  ) %>%
+  arrange(desc(count)) %>%
+  print()
+```
+
+```{r}
+# MAE and % Miss vs Actuals
+test_data %>% 
+  mutate(
+    residual = tow - predictions,
+    prediction = predictions
+  ) %>%
+  group_by(country_code_ades) %>% 
+  summarize(
+    count = n(),
+    pct_of_total = (n() / nrow(test_data)) * 100,
+    mae = mean(abs(residual)),
+    avg_tow = mean(tow),
+    max_pct_tow = mean(abs(residual)) / mean(tow),
+    mape = mean(abs(residual / tow)) * 100,
+    rmse = mean(sqrt((residual)^2)),
+    avg_dist = mean(flown_distance),
+    min_prediction = min(prediction),
+    min_tow = min(tow),
+    max_prediction = max(prediction),
+    max_tow = max(tow)
+  ) %>%
+  arrange(desc(count)) %>%
+  print()
+```
+
+```{r}
+# MAE and % Miss vs Actuals
+test_data %>% 
+  mutate(
+    residual = tow - predictions,
+    prediction = predictions
+  ) %>%
+  group_by(adep) %>% 
+  summarize(
+    count = n(),
+    pct_of_total = (n() / nrow(test_data)) * 100,
+    mae = mean(abs(residual)),
+    avg_tow = mean(tow),
+    max_pct_tow = mean(abs(residual)) / mean(tow),
+    mape = mean(abs(residual / tow)) * 100,
+    rmse = mean(sqrt((residual)^2)),
+    avg_dist = mean(flown_distance),
+    min_prediction = min(prediction),
+    min_tow = min(tow),
+    max_prediction = max(prediction),
+    max_tow = max(tow)
+  ) %>%
+  arrange(desc(count)) %>%
+  print()
+```
+
+```{r}
+# MAE and % Miss vs Actuals
+test_data %>% 
+  mutate(
+    residual = tow - predictions,
+    prediction = predictions
+  ) %>%
+  group_by(ades) %>% 
+  summarize(
+    count = n(),
+    pct_of_total = (n() / nrow(test_data)) * 100,
+    mae = mean(abs(residual)),
+    avg_tow = mean(tow),
+    max_pct_tow = mean(abs(residual)) / mean(tow),
+    mape = mean(abs(residual / tow)) * 100,
+    rmse = mean(sqrt((residual)^2)),
+    avg_dist = mean(flown_distance),
+    min_prediction = min(prediction),
+    min_tow = min(tow),
+    max_prediction = max(prediction),
+    max_tow = max(tow)
+  ) %>%
+  arrange(desc(count)) %>%
+  print()
+```
+
+```{r}
+# MAE and % Miss vs Actuals
+test_data %>% 
+  mutate(
+    residual = tow - predictions,
+    prediction = predictions
+  ) %>%
+  group_by(round(flown_velocity)) %>% 
+  summarize(
+    count = n(),
+    pct_of_total = (n() / nrow(test_data)) * 100,
+    mae = mean(abs(residual)),
+    avg_tow = mean(tow),
+    max_pct_tow = mean(abs(residual)) / mean(tow),
+    mape = mean(abs(residual / tow)) * 100,
+    rmse = mean(sqrt((residual)^2)),
+    avg_dist = mean(flown_distance),
+    min_prediction = min(prediction),
+    min_tow = min(tow),
+    max_prediction = max(prediction),
+    max_tow = max(tow)
+  ) %>%
+  print()
+```
+
+```{r}
+# MAE and % Miss vs Actuals
+test_data %>% 
+  mutate(
+    residual = tow - predictions,
+    prediction = predictions
+  ) %>%
+  group_by(day_of_week) %>% 
+  summarize(
+    count = n(),
+    pct_of_total = (n() / nrow(test_data)) * 100,
+    mae = mean(abs(residual)),
+    avg_tow = mean(tow),
+    max_pct_tow = mean(abs(residual)) / mean(tow),
+    mape = mean(abs(residual / tow)) * 100,
+    rmse = mean(sqrt((residual)^2)),
+    avg_dist = mean(flown_distance),
+    min_prediction = min(prediction),
+    min_tow = min(tow),
+    max_prediction = max(prediction),
+    max_tow = max(tow)
+  ) %>%
+  print()
+```
+
+```{r}
+# MAE and % Miss vs Actuals
+test_data %>% 
+  mutate(
+    residual = tow - predictions,
+    prediction = predictions
+  ) %>%
+  group_by(month_of_year) %>% 
+  summarize(
+    count = n(),
+    pct_of_total = (n() / nrow(test_data)) * 100,
+    mae = mean(abs(residual)),
+    avg_tow = mean(tow),
+    max_pct_tow = mean(abs(residual)) / mean(tow),
+    mape = mean(abs(residual / tow)) * 100,
+    rmse = mean(sqrt((residual)^2)),
+    avg_dist = mean(flown_distance),
+    min_prediction = min(prediction),
+    min_tow = min(tow),
+    max_prediction = max(prediction),
+    max_tow = max(tow)
+  ) %>%
+  print()
+```
+
+```{r}
+# MAE and % Miss vs Actuals
+test_data %>% 
+  mutate(
+    residual = tow - predictions,
+    prediction = predictions
+  ) %>%
+  group_by(week_of_year) %>% 
+  summarize(
+    count = n(),
+    pct_of_total = (n() / nrow(test_data)) * 100,
+    mae = mean(abs(residual)),
+    avg_tow = mean(tow),
+    max_pct_tow = mean(abs(residual)) / mean(tow),
+    mape = mean(abs(residual / tow)) * 100,
+    rmse = mean(sqrt((residual)^2)),
+    avg_dist = mean(flown_distance),
+    min_prediction = min(prediction),
+    min_tow = min(tow),
+    max_prediction = max(prediction),
+    max_tow = max(tow)
+  ) %>%
+  print()
+```
+
+```{r}
+# MAE and % Miss vs Actuals
+test_data %>% 
+  mutate(
+    residual = tow - predictions,
+    prediction = predictions
+  ) %>%
+  group_by(flight_minus_taxiout_duration_bucket) %>% 
+  summarize(
+    count = n(),
+    pct_of_total = (n() / nrow(test_data)) * 100,
+    mae = mean(abs(residual)),
+    avg_tow = mean(tow),
+    max_pct_tow = mean(abs(residual)) / mean(tow),
+    mape = mean(abs(residual / tow)) * 100,
+    rmse = mean(sqrt((residual)^2)),
+    avg_dist = mean(flown_distance),
+    min_prediction = min(prediction),
+    min_tow = min(tow),
+    max_prediction = max(prediction),
+    max_tow = max(tow)
+  ) %>%
+  print()
+```
+
+```{r}
+# MAE and % Miss vs Actuals
+test_data %>% 
+  mutate(
+    residual = tow - predictions,
+    prediction = predictions
+  ) %>%
+  group_by(great_circle_distance_bucket) %>% 
+  summarize(
+    count = n(),
+    pct_of_total = (n() / nrow(test_data)) * 100,
+    mae = mean(abs(residual)),
+    avg_tow = mean(tow),
+    max_pct_tow = mean(abs(residual)) / mean(tow),
+    mape = mean(abs(residual / tow)) * 100,
+    rmse = mean(sqrt((residual)^2)),
+    avg_dist = mean(flown_distance),
+    min_prediction = min(prediction),
+    min_tow = min(tow),
+    max_prediction = max(prediction),
+    max_tow = max(tow)
+  ) %>%
+  print()
+```
+
+```{r}
+qqnorm(residuals)
+```
+
+```{r}
+# Assuming you have a factor variable like `aircraft_type`
+boxplot(residuals ~ test_data$aircraft_type, 
+        main = "Residuals by Aircraft Type", 
+        xlab = "Aircraft Type", 
+        ylab = "Residuals")
+```
+
+```{r}
+# Assuming `time` is your time variable
+plot(test_data$date, residuals, 
+     xlab = "Time", 
+     ylab = "Residuals", 
+     main = "Residuals vs Time")
+abline(h = 0, col = "red")
+```
+
+## Dimensionality Reduction
+
+```{r}
+# library(caret)
+# 
+# # Calculate correlation matrix
+# cor_matrix <- cor(final_summary %>% select_if(is.numeric), use = "complete.obs")
+# 
+# # Find highly correlated features (above a threshold, e.g., 0.9)
+# high_cor_features <- findCorrelation(cor_matrix, cutoff = 0.9)
+# 
+# # Remove highly correlated features
+# # reduced_summary <- final_summary %>% select(-all_of(high_cor_features))
+
+```
+
